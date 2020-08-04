@@ -1,0 +1,1712 @@
+---
+title: "pbcData"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+#Load libraries and data
+```{r}
+library(survival)
+library(ranger)
+library(dplyr)
+library(survminer)
+library(psych)
+library(gmodels)
+library(randomForestSRC)
+library(tidyverse)
+library(ggplot2)
+library(survxai)
+library(fitdistrplus)
+library(actuar)
+
+data(pbc,package = "survival")
+```
+As mentioned in the data description, this data contains information about the clinical trails in primary biliary cirrhosis (PBC) of liver. 312 people participated in the randomized trail and contain largely complete data, an additional 112 followed for survival but for whom only basic measurements have been recorded.
+
+The output is either censored, transplant or dead. (more information about the data can be obtained from typing '?pbc' in the console or refer Appendix of report)
+
+#Data Pre-processing and Analysis
+##Preliminary Study
+
+```{r}
+summary(pbc)
+#pbc
+```
+Modifying the nature of variables
+```{r}
+
+pbc0 <- as_tibble(pbc)
+pbc0 <- mutate_at(pbc0, c("id", "status", "trt", "edema", "stage"), factor) #Categorical variables
+pbc0 <- mutate_at(pbc0, c("hepato", "ascites", "spiders"), as.logical)
+pbc0 <- mutate(pbc0, time = time / 365.25 ) # measure time in years
+
+summary(pbc0)
+```
+Removing transplant cases from analysis, since it is rare and is highly dependent on donor availability.
+```{r}
+# 1 refers to transplant
+pbcData <- subset(pbc, status != 1)
+pbcData <- transform(pbcData, status = as.logical(status))
+
+pbcData <- mutate(pbcData, time = (pbcData$time / 365.25))
+
+#Factoring values
+# sex  : "m" - "Male
+#        "f" - "Female"
+pbcData$sex <- factor(pbcData$sex
+                  , levels = c("m","f")
+                  , labels = c("Male", "Female"))
+# trt : 1 -  “D-penicillmain” 
+#       2 -  “placebo” 
+pbcData$trt <- factor(pbcData$trt #, exclude = NULL
+                  , levels = c(1, 2)#, NA)
+                  , labels = c("D-penicillmain", "placebo"))#, "NotTreated"))
+
+pbcData <- mutate_at(pbcData, c( "edema", "stage"), factor)
+```
+##Descriptive Statistics 
+More Analysis on the correlation between the covariates is available in EDA_report.html
+```{r}
+describe(pbcData) #describe(pbcData$trt) -- can be used for specific covariate
+summary(pbcData) #summary(pbcData$trt)
+```
+
+## Censored data plot 
+59% of the data points are right censored observations (232C + 161E )
+```{r}
+patients <- 50 # change the value to include more or less no of observations in the plot
+plot(c(0, pbcData$time[1]), c(1, 1), type = "l"
+     , ylim = c(0, patients + 5)
+     , xlim = c(0, max(pbcData$time[1:patients]) + 3)
+     , ylab = "Patients", xlab = "Survival time (yrs)"
+     , main ="Censored Survival Data")
+for (i in 1:patients) lines(c(0, pbcData$time[i]), c(i, i)) #?why2:patients
+for (i in 1:patients) 
+    {
+        if (pbcData$status[i] == 0) 
+            points(pbcData$time[i], i, col = "red", pch = 10)  # Censored
+        if (pbcData$status[i] == 1) 
+            points(pbcData$time[i], i, col = "gray", pch = 10) # Event
+    }
+legend("topright"
+       , c("Censored", "Event")
+       , pch = 10
+       , col = c("red", "gray")
+       , bty = "n")
+```
+The Kaplan–Meier estimator, is a non-parametric statistic used to estimate the survival function from lifetime data. A plot of the Kaplan–Meier estimator is a series of declining horizontal steps which, with a large enough sample size, approaches the true survival function for that population. On the plot, small vertical tick-marks indicate individual patients whose survival times have been right-censored. When no truncation or censoring occurs, the Kaplan–Meier curve is the complement of the empirical distribution function.
+
+#Analysis using Kaplan-Meier Plot
+```{r}
+# Create a survival object:
+Surv_OBJ <- Surv(pbcData$time, pbcData$status,type= 'right')
+
+# Fitting the survival model - 1 is to estimate based on overall the pbcData:
+KM_Model <- survfit(Surv_OBJ ~ 1, data = pbcData, conf.type="log-log", type = "kaplan-meier")
+
+# Show the KM information
+KM_Model
+
+# Plot the Estimators:
+ggsurvplot(KM_Model
+           ,data = pbcData
+           ,xlab = "Time in years" 
+           ,surv.median.line = "hv"  
+           ,title="Kaplan-Meier Estimator" 
+           ,palette = "#2E9FDF"
+           ,ggtheme = theme_bw()
+           ) 
+
+```
+Median Survival Time  - 9.19 years
+## What is Kaplan-Meier survival probability over all the data?
+```{r}
+summary(KM_Model)
+```
+Specific probabilities
+```{r}
+# What is the probability of surviving for 1, 3 and 5 years?
+summary(KM_Model,  times = c(1, 3, 5))
+
+```
+
+Now using this model , let us do analysis over a few covariates to understand how are they effecting the survival time.
+
+##KM Survival time  - treatment predictor
+Is there a difference in survival rates between D-penicillmain and placebo?
+```{r Fig0, echo=TRUE, fig.height=6, fig.width=8}
+pbc_trt = pbcData[complete.cases(pbcData$trt), ]
+
+Surv_trt <- Surv(pbc_trt$time, pbc_trt$status)
+logRankTest_trt <- survdiff(Surv_trt ~ trt, data = pbc_trt)
+
+logRankTest_trt
+
+# Plot using KM and ggsurvplot
+KMLR_trt <- survfit(Surv_trt ~ trt, data = pbc_trt, conf.type="log-log")
+
+KMLR_trt
+ggsurvplot(KMLR_trt
+           ,data = pbc_trt
+           ,pval = TRUE
+           ,conf.int = TRUE         
+           #,conf.int.style = "step" # "ribbon"
+           ,xlab = "Time in years" 
+           #,tables.theme = theme_cleantable()
+           ,surv.median.line = "hv"  
+           ,risk.table = TRUE
+           ,title="Kaplan-Meier by Treatment predictor" 
+           ,risk.table.height=.25
+           ,tables.col = "strata"
+           ,tables.y.text = FALSE
+           ,legend.title="Treatment"
+           ,palette = c("#E7B800", "#2E9FDF")
+           ,ggtheme = theme_bw() # theme_light()
+           ,censor = FALSE
+           ,legend.labs = c("D-penicillmain", "placebo")
+           
+           )
+
+```
+Median Survival TIme  :
+D- Pencillmain - 8.82 yrs
+Placebo - 9.30 yrs
+and the confidence intervals overlap at a significance level of 5%
+
+p > 5% : Thus we fail to reject the hypothesis that survival times do not vary between D-Pencillmain and placebo
+
+##KM Model- sex
+Is there a difference of survival times between males and females? 
+```{r Fig1, echo=TRUE, fig.height=6, fig.width=8}
+pbc_sex = pbcData[complete.cases(pbcData$sex), ] #remove missing values
+
+Surv_sex <- Surv(pbc_sex$time, pbc_sex$status)
+logRankTest_sex <- survdiff(Surv_OBJ ~ sex, data = pbc_sex)
+
+logRankTest_sex
+
+# Plot using KM and ggsurvplot
+KMLR_sex <- survfit(Surv_OBJ ~ sex, data = pbc_sex, conf.type="log-log")
+ggsurvplot(KMLR_sex
+           ,data = pbc_sex
+           ,pval = TRUE
+           ,conf.int = TRUE         
+           #,conf.int.style = "step" # "ribbon"
+           ,xlab = "Time in years" 
+           #,tables.theme = theme_cleantable()
+           ,surv.median.line = "hv"  
+           ,risk.table = TRUE
+           ,title="Kaplan-Meier by Sex predictor" 
+           ,risk.table.height=.25
+           ,tables.col = "strata"
+           ,tables.y.text = FALSE
+           ,legend.title="Sex"
+           ,palette = c("#2E9FDF", "#DE9FDF")
+           ,ggtheme = theme_bw() # theme_light()
+           ,censor = FALSE
+           ,legend.labs = c("Male", "Female")
+           )
+KMLR_sex
+```
+ Median Survival TIme(yrs)  :
+ Male  - 6.53
+ Female - 9.31
+ Confidence intervals overlap at 5% significance level
+ 
+ p > 5% : Thus we fail to reject the hypothesis that survival times do not vary between males and females
+ 
+##KM Model - edema
+
+Is there any difference between survival times of different edema factors
+
+```{r Fig2, echo=TRUE, fig.height=6, fig.width=8}
+pbc_edema = pbcData[complete.cases(pbcData$edema), ]
+
+Surv_edema <- Surv(pbc_edema$time, pbc_edema$status)
+logRankTest_edema <- survdiff(Surv_edema ~ edema, data = pbc_edema)
+
+logRankTest_edema
+
+# Plot using KM and ggsurvplot 
+KMLR_edema <- survfit(Surv_edema ~ edema, data = pbc_edema, conf.type="log-log")
+ggsurvplot(KMLR_edema
+           ,data = pbc_edema
+           ,pval = TRUE
+           ,conf.int = TRUE         
+           ,xlab = "Time in years" 
+           ,surv.median.line = "hv"  
+           ,risk.table = TRUE
+           ,title="Kaplan-Meier by Edema predictor" 
+           ,risk.table.height=.25
+           ,tables.col = "strata"
+           ,tables.y.text = FALSE
+           ,legend.title=""
+           ,palette = c("#E7B800", "#2E9FDF", "#DE9FDF")
+           ,ggtheme = theme_bw() # theme_light()
+           ,censor = FALSE
+           ,legend.labs = c("No Edema", "Treated Successfully/Untreated", "Edema")
+           
+           )
+```
+ p < 5% : Thus we reject the null hypothesis and conclude that a significant difference exists
+
+##KM Model - stage
+
+```{r Fig3, echo=TRUE, fig.height=6, fig.width=8}
+pbc_stage = pbcData[complete.cases(pbcData$stage), ]
+
+Surv_stage <- Surv(pbc_stage$time, pbc_stage$status)
+logRankTest_stage <- survdiff(Surv_stage ~ stage, data = pbc_stage)
+
+logRankTest_stage
+
+# Plot using KM and ggsurvplot 
+KMLR_stage <- survfit(Surv_stage ~ stage, data = pbc_stage, conf.type="log-log")
+ggsurvplot(KMLR_stage
+           ,data = pbc_stage
+           ,pval = TRUE
+           #,conf.int = TRUE         
+           ,xlab = "Time in years" 
+           ,surv.median.line = "hv"  
+           ,risk.table = TRUE
+           ,title="Kaplan-Meier by Stage predictor" 
+           ,risk.table.height=.25
+           ,tables.col = "strata"
+           ,tables.y.text = FALSE
+           ,legend.title=""
+           ,ggtheme = theme_bw() # theme_light()
+           ,censor = FALSE
+           
+           )
+```
+We observe an impact of the stage, as expected. In particular, the curvature of the function becomes upward for stage 4, indicating a high mortality in the first years after diagnostic. We also see that survival is almost 100% for patients at stage 1 but the number of patients is quite small at this stage, leading to high uncertainty.
+To get rid of any doubt on that, we can check whether stage 1 and 2 are significantly different or not :
+
+```{r}
+pbc_temp <- pbc_stage[ pbc_stage$stage %in% c("1", "2"),  ]
+logrank_stage <- survdiff( Surv( time, status ) ~ stage, data = pbc_temp )
+logrank_stage
+```
+p > 5% : According to the logrank test, we can not reject the hypothesis that survivals at stage 1 and 2 have the same distributions. We decide to merge those 2 levels into a new indicator 'stageM'. Now we can check the same for stageM and 3.
+
+```{r}
+pbcData$stageM <- fct_collapse(pbcData$stage, "12" = c("1", "2"))
+pbc_temp <- pbcData[ pbcData$stageM %in% c("12", "3"),  ]
+logrank_stage <- survdiff( Surv( time, status ) ~ stageM, data = pbc_temp )
+logrank_stage
+
+
+```
+p < 5% : According to the logrank test, we reject the hypothesis that stages 12 and 3 have the same distributions.  
+On the other hand, if we compare stages 3 and 4 :
+
+```{r}
+pbc_temp <- pbcData[ pbcData$stageM %in% c("3", "4"),  ]
+logrank_stage <- survdiff( Surv( time, status ) ~ stageM, data = pbc_temp )
+logrank_stage
+```
+p << 5% : there is no doubt that according to the stage 3 or 4 of the patient, survival will be different (this is a consequence of the change in curvature).
+
+Explaining Survival with age
+##KM Model - age 
+Age variable is made into a categorical variable with groups as follows :
+
+ AGE  GROUP
+20-30   2
+30-40   3
+40-50   4
+50-60   5
+60-70   6
+70-80   7
+```{r Fig4, echo=TRUE, fig.height=10, fig.width=10}
+pbc_age = pbcData[complete.cases(pbcData$age), ]
+pbc_age <- mutate(pbc_age, ageD = floor(age / 10))
+
+Surv_age <- Surv(pbc_age$time, pbc_age$status)
+logRankTest_age <- survdiff(Surv_age ~ ageD, data = pbc_age)
+
+logRankTest_age
+
+# Plot using KM and ggsurvplot 
+KMLR_age <- survfit(Surv_age ~ ageD, data = pbc_age, conf.type="log-log")
+ggsurvplot(KMLR_age
+           ,data = pbc_age
+           ,pval = TRUE
+           #,conf.int = TRUE         
+           ,xlab = "Time in years" 
+           ,surv.median.line = "hv"  
+           ,risk.table = TRUE
+           ,title="Kaplan-Meier by age predictor" 
+           ,risk.table.height=.25
+           ,tables.col = "strata"
+           ,tables.y.text = FALSE
+           ,legend.title="Age windows"
+           ,legend.labs = c("20-30","30-40","40-50","50-60","60-70","70-80")
+           ,ggtheme = theme_bw() # theme_light()
+           ,censor = FALSE
+           
+           )
+```
+Thus survival differences exist among various age groups
+
+```{r}
+pbc_age <- pbc_age[complete.cases(pbc_age),]
+pbc_age_pair <- pairwise_survdiff(formula=Surv(time,status) ~ ageD,data = pbc_age)
+pbc_age_pair
+```
+From the results obtained from the paired logrank test, we can conclude that there is no much difference in survival rates among a particular age group and the immediate groups except with the 4th group. This indicates that people having age in between 40-60 are the most effected.
+
+##KM Analysis with pair of variables
+
+###Sex-Age
+
+```{r Fig5, echo=TRUE, fig.height=10, fig.width=9}
+pbc_age_sex = pbcData[complete.cases(pbcData$age,pbcData$sex), ] #remove missing values
+pbc_age_sex <- mutate(pbc_age_sex, ageD = floor(age / 10))
+Surv_age_sex <- Surv(pbc_age_sex$time, pbc_age_sex$status)
+
+# Plot using KM and ggsurvplot
+KMLR_age_sex <- survfit(Surv_age_sex ~ ageD+sex, data = pbc_age_sex, conf.type="log-log")
+ggsurvplot(KMLR_age_sex
+           ,data = pbc_age_sex
+           ,pval = TRUE
+           ,conf.int = FALSE        
+           #,conf.int.style = "step" # "ribbon"
+           ,xlab = "Time in years" 
+           #,tables.theme = theme_cleantable()
+           ,surv.median.line = "hv"  
+           ,risk.table = TRUE
+           ,title="Kaplan-Meier by Age and Sex predictor" 
+           ,risk.table.height=.25
+           ,tables.col = "strata"
+           ,tables.y.text = FALSE
+           ,legend.title="Age-Sex"
+           #,palette = c("#2E9FDF", "#DE9FDF")
+           ,ggtheme = theme_bw() # theme_light()
+           ,censor = FALSE
+           #,legend.labs = c("Male", "Female")
+           )
+KMLR_age_sex
+
+
+joined <- array(1:nrow(pbc_age_sex))
+
+for(i in 1:nrow(pbc_age_sex)){
+  if(pbc_age_sex$sex[i]=="Male"){
+    if(pbc_age_sex$ageD[i] == "2"){
+      joined[i] = "m_2"
+    }else if(pbc_age_sex$ageD[i] == "3"){
+      joined[i] = "m_3"
+    }else if(pbc_age_sex$ageD[i] == "4"){
+      joined[i] = "m_4"
+    }else if(pbc_age_sex$ageD[i] == "5"){
+      joined[i] = "m_5"
+    }else if(pbc_age_sex$ageD[i] == "6"){
+      joined[i] = "m_6"
+    }else{
+      joined[i] = "m_7"
+    }
+  }else{
+    if(pbc_age_sex$ageD[i] == "2"){
+      joined[i] = "f_2"
+    }else if(pbc_age_sex$ageD[i] == "3"){
+      joined[i] = "f_3"
+    }else if(pbc_age_sex$ageD[i] == "4"){
+      joined[i] = "f_4"
+    }else if(pbc_age_sex$ageD[i] == "5"){
+      joined[i] = "f_5"
+    }else if(pbc_age_sex$ageD[i] == "6"){
+      joined[i] = "f_6"
+    }else{
+      joined[i] = "f_7"
+    }
+  }
+  
+}
+
+pbc_age_sex$joined <- joined
+
+pairtest_age_sex <- pairwise_survdiff(formula = Surv(time,status)~joined,data=pbc_age_sex)
+pairtest_age_sex
+
+
+```
+There is no significant survival difference observed between the groups obtained by pairing sex and age terms. However, females in the age groups of 30-40 are observed to have survival difference with males in the age group of  50-60.
+
+
+###Sex-Treatment
+
+```{r Fig6, echo=TRUE, fig.height=6, fig.width=9}
+pbc_sex_trt = pbcData[complete.cases(pbcData$sex,pbcData$trt), ] #remove missing values
+
+Surv_sex_trt <- Surv(pbc_sex_trt$time, pbc_sex_trt$status)
+logRankTest_sex_trt<- survdiff(Surv_sex_trt ~ sex+trt, data = pbc_sex_trt)
+
+logRankTest_sex_trt
+
+# Plot using KM and ggsurvplot
+KMLR_sex_trt <- survfit(Surv_sex_trt ~ sex+trt, data = pbc_sex_trt, conf.type="log-log")
+ggsurvplot(KMLR_sex_trt
+           ,data = pbc_sex_trt
+           ,pval = TRUE
+           ,conf.int = FALSE        
+           #,conf.int.style = "step" # "ribbon"
+           ,xlab = "Time in years" 
+           #,tables.theme = theme_cleantable()
+           ,surv.median.line = "hv"  
+           ,risk.table = TRUE
+           ,title="Kaplan-Meier by Sex and Treatment predictor" 
+           ,risk.table.height=.25
+           ,tables.col = "strata"
+           ,tables.y.text = FALSE
+           ,legend.title="Sex-Treatment"
+           #,palette = c("#2E9FDF", "#DE9FDF")
+           ,ggtheme = theme_bw() # theme_light()
+           ,censor = FALSE
+           #,legend.labs = c("Male", "Female")
+           )
+KMLR_sex_trt
+
+
+joined <- array(1:nrow(pbc_sex_trt))
+
+for(i in 1:nrow(pbc_sex_trt)){
+  if(pbc_sex_trt$sex[i]=="Male"){
+    if(pbc_sex_trt$trt[i] == "D-penicillmain"){
+      joined[i] = "m_0"
+    }else{
+      joined[i] = "m_1"
+    }
+  }else{
+    if(pbc_sex_trt$trt[i] == "D-penicillmain"){
+      joined[i] = "f_0"
+    }else{
+      joined[i] = "f_1"
+    }
+  }
+  
+}
+
+pbc_sex_trt$joined <- joined
+
+pairtest_sex_trt <- pairwise_survdiff(formula = Surv(time,status)~joined,data=pbc_sex_trt)
+pairtest_sex_trt
+
+
+```
+Earlier we saw that sex and treatment did not have a significant difference on the survival times. However it is the same case when the 2 covariates are paired and tested for difference in survival times.
+
+###Age-Treatment
+
+```{r Fig7, echo=TRUE, fig.height=10, fig.width=9}
+pbc_age_trt = pbcData[complete.cases(pbcData$age,pbcData$trt), ] #remove missing values
+pbc_age_trt <- mutate(pbc_age_trt, ageD = floor(age / 10))
+Surv_age_trt <- Surv(pbc_age_trt$time, pbc_age_trt$status)
+logRankTest_age_trt<- survdiff(Surv_age_trt ~ ageD+trt, data = pbc_age_trt)
+
+logRankTest_age_trt
+
+# Plot using KM and ggsurvplot
+KMLR_age_trt <- survfit(Surv_age_trt ~ ageD+trt, data = pbc_age_trt, conf.type="log-log")
+ggsurvplot(KMLR_age_trt
+           ,data = pbc_age_trt
+           ,pval = TRUE
+           ,conf.int = FALSE        
+           #,conf.int.style = "step" # "ribbon"
+           ,xlab = "Time in years" 
+           #,tables.theme = theme_cleantable()
+           ,surv.median.line = "hv"  
+           ,risk.table = TRUE
+           ,title="Kaplan-Meier by Age and Treatment predictor" 
+           ,risk.table.height=.25
+           ,tables.col = "strata"
+           ,tables.y.text = FALSE
+           ,legend.title="Age-Treatment"
+           #,palette = c("#2E9FDF", "#DE9FDF")
+           ,ggtheme = theme_bw() # theme_light()
+           ,censor = FALSE
+           #,legend.labs = c("Male", "Female")
+           )
+KMLR_age_trt
+
+
+joined <- array(1:nrow(pbc_age_trt))
+
+for(i in 1:nrow(pbc_age_trt)){
+  if(pbc_age_trt$trt[i] == "D-penicillmain"){
+    if(pbc_age_trt$ageD[i] == "2"){
+      joined[i] = "0_2"
+    }else if(pbc_age_trt$ageD[i] == "3"){
+      joined[i] = "0_3"
+    }else if(pbc_age_trt$ageD[i] == "4"){
+      joined[i] = "0_4"
+    }else if(pbc_age_trt$ageD[i] == "5"){
+      joined[i] = "0_5"
+    }else if(pbc_age_trt$ageD[i] == "6"){
+      joined[i] = "0_6"
+    }else{
+      joined[i] = "0_7"
+    }
+  }else{
+    if(pbc_age_trt$ageD[i] == "2"){
+      joined[i] = "1_2"
+    }else if(pbc_age_trt$ageD[i] == "3"){
+      joined[i] = "1_3"
+    }else if(pbc_age_trt$ageD[i] == "4"){
+      joined[i] = "1_4"
+    }else if(pbc_age_trt$ageD[i] == "5"){
+      joined[i] = "1_5"
+    }else if(pbc_age_trt$ageD[i] == "6"){
+      joined[i] = "1_6"
+    }else{
+      joined[i] = "1_7"
+    }
+  }
+  
+}
+
+pbc_age_trt$joined <- joined
+
+pairtest_age_trt <- pairwise_survdiff(formula = Surv(time,status)~joined,data=pbc_age_trt)
+pairtest_age_trt
+
+
+```
+Treatment didnot have a significant effect on the survival times. On coupling the treatment variable with age groups too, we dont observe a significant effect
+
+#Cox Proportional Hazard Model
+Semi parametric , robust model. 
+PH Assumption : Hazards are proportional independent of time.
+```{r}
+
+Cox_Data = pbcData[complete.cases(pbcData), ]
+Cox_Data <- mutate(Cox_Data, ageD = age/10 )
+Surv_Cox <- Surv(Cox_Data$time, Cox_Data$status)
+
+COX_Model <- coxph(Surv_Cox ~ ageD 
+                 + alk.phos
+                 + albumin 
+                 + ascites
+                 + ast
+                 + bili
+                 + chol
+                 + copper
+                 + edema 
+                 + hepato
+                 + platelet
+                 + protime
+                 + sex 
+                 + spiders
+                 + stageM
+                 + trt
+                 + trig
+                 , data = Cox_Data)
+
+# Show the Cox details:
+#COX_Model
+
+#Plot Cox curve
+ggsurvplot(survfit(COX_Model)
+           ,data=Cox_Data
+           ,xlab = "Time in time"
+           ,title="Cox Proportional Hazard Model - 17 predictors"
+           ,ggtheme = theme_light()
+           ,legend.title="Predictors"
+           ,surv.median.line = "hv"
+           #,censor = FALSE
+           ,palette = "#E7B800")
+
+```
+
+```{r}
+summary(COX_Model)
+```
+There are many non-significant parameters according to wald test but the overall model is significant. Hence it is important to do analysis and select the important parameters.
+
+## Model Building 
+### Step wise model selection based on AIC
+we proceed to a variable selection based on AKIK information criteria which allows comparing models
+
+The Akaike information criterion (AIC) is an estimator of out-of-sample prediction error and thereby relative quality of statistical models for a given set of data. Given a collection of models for the data, AIC estimates the quality of each model, relative to each of the other models. Thus, AIC provides a means for model selection.
+
+Lower the AIC, better the model is.
+```{r}
+# using automated process to find the best model
+best_cox <- step(COX_Model)
+```
+Starting with a model containing 17 covariates with an AIC value of 965.62, the best cox model obtained contains 8 covariates and has AIC value of 951.53
+
+```{r}
+summary(best_cox)
+
+```
+According to the Harrell's concordance index, 84% of pairs of patients are correctly ordered by the model which is quite good.(the patient with the higher risk score should have a shorter time-to-disease.)
+
+###Wald Test
+According to the Wald test on each variable, we reject the hypothesis that those coefficients are null except for 'edema0.5'  (untreated or successfully treated edema), 'stageM3' (3rd stage - needs biopsy).
+
+Thus ,we remove (merge accordingly) 'edema0.5', 'stageM3' because of poor Wald test indicating low impact.
+
+```{r}
+Cox_Data$stageM <- fct_collapse(Cox_Data$stageM,'34'  = c("3", "4"))
+Cox_Data$edemaM <- fct_collapse(Cox_Data$edema,'0_0.5'  = c("0", "0.5"))
+
+#Cox_DataM <- mutate(Cox_Data, edemaM = as.integer( as.integer( edema == 1 ) ) )
+
+best_cox <- coxph(formula = Surv_Cox ~ ageD + albumin + ast + bili + copper + 
+    edemaM + protime + stageM, data = Cox_Data)
+summary(best_cox)
+```
+Concordance remains same
+Hazard Ratios:
+
+* 'edemaM' : the presence of an edema despite diuretic therapy multiplies risk of death by 2.32 compared to absence of edema, untreated or successfully treated edema.
+* 'protime' : an increase of 1 time unit in standardized blood clotting time multiplies the risk of death by 1.27 . [Based on the observed distribution, it means that a small group of patients are at very high risk.]
+* 'ageD' : one more decade in age multiplies risk by 1.36 .
+* 'albumin' : albumin has a negative effect on hazard : an increase of 1 g/dl in serum albumin divides the risk of death by 0.40 .
+* 'bili' : an increase of 1 mg/dl in serum bilirunbin multiplies risk of death by 1.09, no significant risk involved
+* 'ast' and 'copper' : No significant positive or negative effect observed - Hazard ratio : 1.0035 and 1.003 respectively
+* 'stage34' : if the candidate is in stage 3 or 4 then it would multiply risk of death by 1.95 compared to stage 1 and 2  
+
+
+## What are the top 10 risky cases in the above model? 
+```{r}
+
+risk_data <-
+  Cox_Data %>%
+  mutate(risk_score = predict(best_cox, newdata = Cox_Data, type = "risk"))
+
+# Arrange the data desc. and view the top 5 risks:
+risk_data %>%
+  arrange(desc(risk_score)) %>%
+  head(10)
+```
+Top 10 risky cases observed are those patients who observed the event - death, which is as expected. 9/10 of them are females and these 7/10 patients lie in the age group of 50-70 
+
+##Test for proportional hazard assumption
+```{r}
+SRPH  <- cox.zph(best_cox, transform = "km")
+SRPH
+
+```
+p<5%  reject the null that the variable follows Proportional hazards
+bili, protime doesnot follow PH Assumption
+
+Preliminary study shows that 'bili' and 'protime' are dense for small values and a very large interval [Q3, Q4]. It might be useful to transform those variables when trying regression. Let us introduce logarithms of bili, protime to spread their values and see if the model selects these over bili, protime - 
+```{r}
+best_coxs <- coxph(formula = Surv_Cox ~ ageD + albumin + ast + log2(bili)+bili + copper + 
+    edemaM + log2(protime)+protime + stageM, data = Cox_Data)
+summary(best_coxs)
+```
+As indicated by the wald test, bili, protime are non significant variables. Now let us check for PH assumption by removing these variables.
+
+```{r}
+best_cox <- coxph(formula = Surv_Cox ~ ageD + albumin + ast + log2(bili)+ copper + 
+    edemaM + log2(protime) + stageM, data = Cox_Data)
+summary(best_cox)
+res <- cox.zph(best_cox)
+res
+```
+Concordance improved from 84% to 84.7% indicating that this is a better model. And PH Assumption is also fulfilled by this new model.
+(If the assumption is violated, then we should try time varying COX PH or a Stratified COX PH model)
+
+#Random Forests
+
+A random forest is a non parametric machine learning strategy that can be used for building a risk prediction model in survival analysis. In survival settings, the predictor is an ensemble formed by combining the results of many survival trees. [More details in the Report]
+
+```{r}
+pbcData<- mutate(pbcData,ageD = age/10)
+# Drop rows with NA values from the dataset
+RF_Data = pbcData[complete.cases(pbcData), ][,-c(1)]
+# Fitting the random forest
+RF_Model <- ranger(Surv(RF_Data$time
+                            , RF_Data$status) ~.
+                       ,data = RF_Data
+                       , num.trees = 500
+                       , importance = "permutation"
+                       ,seed = 1)
+ 
+# Get the variable importance
+data.frame(sort(RF_Model$variable.importance
+                ,decreasing = TRUE))
+```
+
+## Plot the death times
+```{r}
+plot(RF_Model$unique.death.times
+     , RF_Model$survival[1,]
+     , type = "l", ylim = c(0,1)
+     ,)
+```
+
+# Comparing models: KM_Model,best_cox,RF_Model
+```{r}
+# Add a row of model name
+km <- rep("Kaplan Meier", length(KM_Model$time))
+cox_surv <- survfit(best_cox)
+cox <- rep("Cox HP", length(cox_surv$time))
+rf <- rep("Survival Forest",length(RF_Model$unique.death.times))
+# Create a dataframe
+km_df <- data.frame(KM_Model$time, KM_Model$surv, km)
+cox_df <- data.frame(cox_surv$time, cox_surv$surv, cox)
+rf_df <- data.frame(RF_Model$unique.death.times,sapply(data.frame(RF_Model$survival),mean),rf)
+# Rename the columns so they are same for all dataframes
+names(km_df) <- c("Time","Surv","Model")
+names(cox_df) <- c("Time","Surv","Model")
+names(rf_df) <- c("Time","Surv","Model")
+# Combine the results
+plot_combo <- rbind(km_df,cox_df,rf_df)
+ 
+# Make a ggplot
+plot_gg <- ggplot(plot_combo, aes(x = Time, y = Surv, color = Model))
+plot_gg + geom_line() + ggtitle("Comparison of Survival Curves")
+```
+
+#Train and Test split
+```{r}
+pbcData<- mutate(pbcData,ageD = age/10)
+pbcData = pbcData[complete.cases(pbcData), ]
+train_size = floor(0.8*nrow(pbcData))
+set.seed(123)
+train_ind <- sample(seq_len(nrow(pbcData)), size = train_size)
+
+train <- pbcData[train_ind,]
+test <- pbcData[-train_ind,]
+
+```
+
+#Parametric Survival Regression Model
+
+##Check for Probability Distribution
+```{r}
+plotdist(pbcData$time, histo = TRUE, demp = TRUE)
+
+fw <- fitdist(pbcData$time, "weibull")
+fln <- fitdist(pbcData$time, "lnorm")
+fe <- fitdist(pbcData$time, "exp")
+fll<- fitdist(pbcData$time, "llogis",start = list(shape = 1, scale = 500))
+
+plot.legend <- c("Weibull", "lognormal","Exp","loglogistic")
+denscomp(list(fw, fln,fe,fll), legendtext = plot.legend)
+qqcomp(list(fw, fln, fe,fll), legendtext = plot.legend)
+cdfcomp(list(fw, fln,fe,fll), legendtext = plot.legend)
+ppcomp(list(fw, fln,fe,fll), legendtext = plot.legend)
+summary(fw)
+summary(fln)
+summary(fe)
+summary(fll)
+```
+Log likelihood and AIC values obtained after fitting the respective distributions suggest that weibull is the best fit, however there's no much difference between these values across the 4 fits. So, let us try to do parametric regression using all the 4 distributions.
+
+##Parametric regression
+```{r}
+Surv_OBJ = Surv(train$time, train$status,type= 'right')
+weibull_reg <-survreg(Surv_OBJ ~ ageD 
+                 + alk.phos
+                 + albumin 
+                 + ascites
+                 + ast
+                 + bili
+                 + chol
+                 + copper
+                 + edema 
+                 + hepato
+                 + platelet
+                 + protime
+                 + sex 
+                 + spiders
+                 + stageM
+                 + trt
+                 + trig,data  = train , x= TRUE, dist = "weibull")
+summary(weibull_reg)
+
+exp_reg <- survreg(Surv_OBJ ~  ageD 
+                 + alk.phos
+                 + albumin 
+                 + ascites
+                 + ast
+                 + bili
+                 + chol
+                 + copper
+                 + edema 
+                 + hepato
+                 + platelet
+                 + protime
+                 + sex 
+                 + spiders
+                 + stageM
+                 + trt
+                 + trig,data  = train , x= TRUE, dist = "exponential")
+summary(exp_reg)
+
+loglogistic_reg <- survreg(Surv_OBJ ~ ageD 
+                 + alk.phos
+                 + albumin 
+                 + ascites
+                 + ast
+                 + bili
+                 + chol
+                 + copper
+                 + edema 
+                 + hepato
+                 + platelet
+                 + protime
+                 + sex 
+                 + spiders
+                 + stageM
+                 + trt
+                 + trig,data  = train , x= TRUE, dist = "loglogistic")
+summary(loglogistic_reg)
+
+lognormal_reg <- survreg(Surv_OBJ ~ ageD 
+                 + alk.phos
+                 + albumin 
+                 + ascites
+                 + ast
+                 + bili
+                 + chol
+                 + copper
+                 + edema 
+                 + hepato
+                 + platelet
+                 + protime
+                 + sex 
+                 + spiders
+                 + stageM
+                 + trt
+                 + trig,data  = train , x= TRUE, dist = "lognormal")
+summary(lognormal_reg)
+
+```
+
+##Compare Paramteric regression models
+
+Log-Likelihood Values -
+
+Weibull : -255.4 
+Exponential : -268.5 
+Log Normal : -255.3
+Log Logistic  : -252.5
+
+Predicting on Test data set
+```{r}
+weibull_predict <- predict(weibull_reg, newdata=test, type="response")
+exp_predict <- predict(exp_reg, newdata=test, type="response")
+loglogistic_predict <- predict(loglogistic_reg, newdata=test, type="response")
+lognormal_predict <- predict(lognormal_reg, newdata=test, type="response")
+
+test_df <-data.frame(test[['time']],weibull_predict,exp_predict,loglogistic_predict,lognormal_predict)
+names(test_df) <- c('Test_time','Weibull','Exponential','Log-Logistic','Lognormal')
+
+test_df
+
+test_df$res_w <- test_df[['Test_time']] - test_df[['Weibull']]
+test_df$res_e <- test_df[['Test_time']] - test_df[['Exponential']]
+test_df$res_ll <- test_df[['Test_time']] - test_df[['Log-Logistic']]
+test_df$res_ln <- test_df[['Test_time']] - test_df[['Lognormal']]
+
+
+id <- 1:52
+zeros <- (rep(0, 52))
+```
+###Residualplot
+```{r}
+plot(id,test_df$res_w,main = 'Residual Plot',ylab = 'Residual',type = 'l',col = 'blue',xlim=c(0,52),ylim = c(-50,50))
+lines(id,test_df$res_e,col = 'red')
+lines(id,test_df$res_ll,col = 'black')
+lines(id,test_df$res_ln,col = 'green')
+lines(id,zeros,col = 'yellow')
+legend('topright',c('Weibull','Exponential','LogLogistic','LogNormal','zero-level'),fill = c('blue','red','black','green','yellow'))
+```
+
+### Errors
+```{r}
+w_error <- sum(abs(test_df$res_w))
+e_error <- sum(abs(test_df$res_e))
+ll_error <- sum(abs(test_df$res_ll))
+ln_error <- sum(abs(test_df$res_ln))
+
+c("Weibull Error - ", w_error)
+c("Exponential Error - ",e_error)
+c("LogLogistic Error - ",ll_error) 
+c("Log Normal Error - ",ln_error)
+
+```
+Log logistic model is the best fit among the parametric regression models. This is also supported by the log likelihood values obtained after fitting various probability distributions.
+(Weibull is the first best fit and log logistic is the second best fit)
+
+#Mixture Model
+
+A mixture model is a collection of probability distributions or densities D1, …, Dk  and mixing weights or proportions w1, …, wk, where k is the number of component distributions 
+
+The mixture model,   P(x|D1,…,Dk,w1,…,wk) = ∑ wj*P(x|Dj) j= 1 to k
+
+Likelihood :
+
+exact lifetimes : f (x)
+right-censored observations : S (C_r )
+left-censored observations : 1 - S (C_l )
+interval-censored observations : [S (L) - S (R)]
+left-truncated observations : f (x)/ S (Y_L )
+right-truncated observations : f (x)/ [1 - S (Y_R) ]
+interval-truncated observations : f (x)/ [S (Y_L) - S (Y_R)
+
+However, PBC Dataset consists of only Right Censored observations
+
+The covariates output by the bestcox model are: [bili exempted because it violates PH Assumption]
+ageD  
+albumin 
+ast     
+copper
+edemaM
+protime 
+stageM
+
+The covariates in importance order output by Random forests model:
+bili	
+copper	
+ascites	
+albumin		
+edema	
+chol
+ageD	
+protime	
+ast
+stage
+
+Here, Covariates are used to model the mean/shape parameter in the component distributions. Numbers of mixtures is varied from 2 to 8 and optimal value is determined by the mixture model with least log likelihood value.
+
+```{r}
+pbcData2 <- subset(pbc, status != 1)
+pbcData2 = pbcData2[complete.cases(pbcData2), ]
+pbcData2 <- mutate(pbcData2, time = (pbcData2$time / 365.25))
+pbcData2 <- mutate(pbcData2, ast = (pbcData2$ast / 100))
+pbcData2 <- mutate(pbcData2, copper = (pbcData2$copper / 50))
+pbcData2 <- mutate(pbcData2, chol = (pbcData2$chol / 200))
+pbcData2 <- mutate(pbcData2, bili = (pbcData2$bili / 2))
+pbcData2 <- mutate(pbcData2, protime = (pbcData2$protime / 4))
+pbcData2$status[pbcData2$status==2] <- 1
+pbcData2<- mutate(pbcData2,ageD = age/10)
+pbcData2
+```
+```{r}
+summary(pbcData2)
+```
+```{r}
+mm_df <- data_frame(pbcData2$time,
+                    pbcData2$status,
+                    pbcData2$ageD,
+                    pbcData2$albumin,
+                    pbcData2$ast,
+                    pbcData2$bili,
+                    pbcData2$copper,
+                    pbcData2$edema,
+                    pbcData2$protime,
+                    pbcData2$stage,
+                    pbcData2$ascites,
+                    pbcData2$chol)
+names(mm_df) <- c("time","status","ageD","albumin","ast","bili","copper","edema","protime","stage",'ascites','chol')
+mm_df
+```
+## Lognormal with best cox model covariates
+```{r}
+# choosing the number of mixtures
+  ll <- function(par,x) {
+      t = x[,1] 
+      C_r = x[,2]
+      ageD = x[,3]
+      albumin = x[,4]
+      ast = x[,5]
+      bili = x[,6]
+      copper = x[,7]
+      edema = x[,8]
+      protime = x[,9]
+      stage = x[,10]
+      ascites = x[,11]
+      chol= x[,12]
+      j = 1
+      k = 1
+      f_t = 0
+      F_t = 0
+      div = 0
+      while (j <= i){
+        f_t = f_t + (par[k]*dlnorm(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage,
+                                   par[k+8]))
+        F_t = F_t + (par[k]*plnorm(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage,
+                                   par[k+8]))
+        div = div + par[k]
+        j=j+1
+        k=k+9
+      }
+    f_t = f_t/div
+    F_t = F_t/div
+    S_t = 1-F_t
+    
+    R = (1-C_r)*f_t + C_r*S_t 
+    
+    -sum(log(R))
+    }
+  n_mixtures = seq(2,8)
+  
+  set.seed(11)
+  
+  X = mm_df[['time']]
+  mux_init = mean(X)
+  sdx_init = sd(X)
+  
+  C_r =  mm_df[['status']]
+  mucr_init = mean(C_r)
+  sdcr_init = sd(C_r)
+
+  
+  data1 = cbind(X,C_r,mm_df[['ageD']],mm_df[['albumin']],mm_df[['ast']],mm_df[['bili']],mm_df[['copper']],mm_df[['edema']],mm_df[['protime']],mm_df[['stage']],mm_df[['ascites']],mm_df[['chol']])
+
+  p = c(0.5,0.1,0.1,0.1,0.1,0.1,0.1,0.1,sdx_init)
+  l = c(0,-1,-1,-1,-1,-1,-1,-1,0)
+  u = c(1,1,1,1,1,1,1,1,Inf)
+  res = c(0)
+  for (i in n_mixtures){
+    p <- append(p,c(0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,sdx_init*0.1*i))
+    l <- append(l,c(0,-1,-1,-1,-1,-1,-1,-1,0))
+    u <- append(u,c(1,1,1,1,1,1,1,1,Inf))
+    result <- optim(par = p,ll,x=data1,method = "L-BFGS-B", lower = l, upper = u)
+    res <- append(res,result)
+  }
+  print(res)
+  
+```
+Observation :
+Best Model : Mixture of 8 Lognormal models
+loglikelihood : -363.2742
+
+##Lognormal with Random forests covariates
+```{r}
+# choosing the number of mixtures
+  ll <- function(par,x) {
+      t = x[,1] 
+      C_r = x[,2]
+      ageD = x[,3]
+      albumin = x[,4]
+      ast = x[,5]
+      bili = x[,6]
+      copper = x[,7]
+      edema = x[,8]
+      protime = x[,9]
+      stage = x[,10]
+      ascites = x[,11]
+      chol= x[,12]
+      j = 1
+      k = 1
+      f_t = 0
+      F_t = 0
+      div = 0
+      while (j <= i){
+        f_t = f_t + (par[k]*dlnorm(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage+
+                                   par[k+8]*ascites+
+                                   par[k+9]*bili+
+                                   par[k+10]*chol,
+                                   par[k+11]))
+        F_t = F_t + (par[k]*plnorm(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage+
+                                   par[k+8]*ascites+
+                                   par[k+9]*bili+
+                                   par[k+10]*chol,
+                                   par[k+11]))
+        div = div + par[k]
+        j=j+1
+        k=k+12
+      }
+    f_t = f_t/div
+    F_t = F_t/div
+    S_t = 1-F_t
+    
+    R = (1-C_r)*f_t + C_r*S_t 
+    
+    -sum(log(R))
+    }
+  n_mixtures = seq(2,8)
+  
+  set.seed(11)
+  
+  X = mm_df[['time']]
+  mux_init = mean(X)
+  sdx_init = sd(X)
+  
+  C_r =  mm_df[['status']]
+  mucr_init = mean(C_r)
+  sdcr_init = sd(C_r)
+
+  
+  data1 = cbind(X,C_r,mm_df[['ageD']],mm_df[['albumin']],mm_df[['ast']],mm_df[['bili']],mm_df[['copper']],mm_df[['edema']],mm_df[['protime']],mm_df[['stage']],mm_df[['ascites']],mm_df[['chol']])
+
+  p = c(0.5,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,sdx_init)
+  l = c(0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0)
+  u = c(1,1,1,1,1,1,1,1,1,1,1,Inf)
+  res = c(0)
+  for (i in n_mixtures){
+    p <- append(p,c(0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,sdx_init*0.1*i))
+    l <- append(l,c(0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0))
+    u <- append(u,c(1,1,1,1,1,1,1,1,1,1,1,Inf))
+    result <- optim(par = p,ll,x=data1,method = "L-BFGS-B", lower = l, upper = u)
+    res <- append(res,result)
+  }
+  print(res)
+```
+Observation :
+Best Model : Mixture of 8 Lognormal models
+loglikelihood : -362.9548
+
+## Normal with best cox model covariates
+```{r}
+# choosing the number of mixtures
+  ll <- function(par,x) {
+      t = x[,1] 
+      C_r = x[,2]
+      ageD = x[,3]
+      albumin = x[,4]
+      ast = x[,5]
+      bili = x[,6]
+      copper = x[,7]
+      edema = x[,8]
+      protime = x[,9]
+      stage = x[,10]
+      ascites = x[,11]
+      chol= x[,12]
+      j = 1
+      k = 1
+      f_t = 0
+      F_t = 0
+      div = 0
+      while (j <= i){
+        f_t = f_t + (par[k]*dnorm(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage,
+                                   par[k+8]))
+        F_t = F_t + (par[k]*pnorm(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage,
+                                   par[k+8]))
+        div = div + par[k]
+        j=j+1
+        k=k+9
+      }
+    f_t = f_t/div
+    F_t = F_t/div
+    S_t = 1-F_t
+    
+    R = (1-C_r)*f_t + C_r*S_t 
+    
+    -sum(log(R))
+    }
+  n_mixtures = seq(2,8)
+  
+  set.seed(11)
+  
+  X = mm_df[['time']]
+  mux_init = mean(X)
+  sdx_init = sd(X)
+  
+  C_r =  mm_df[['status']]
+  mucr_init = mean(C_r)
+  sdcr_init = sd(C_r)
+
+  
+  data1 = cbind(X,C_r,mm_df[['ageD']],mm_df[['albumin']],mm_df[['ast']],mm_df[['bili']],mm_df[['copper']],mm_df[['edema']],mm_df[['protime']],mm_df[['stage']],mm_df[['ascites']],mm_df[['chol']])
+
+  p = c(0.5,0.1,0.1,0.1,0.1,0.1,0.1,0.1,sdx_init)
+  l = c(0,-1,-1,-1,-1,-1,-1,-1,0)
+  u = c(1,1,1,1,1,1,1,1,Inf)
+  res = c(0)
+  for (i in n_mixtures){
+    p <- append(p,c(0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,sdx_init*0.1*i))
+    l <- append(l,c(0,-1,-1,-1,-1,-1,-1,-1,0))
+    u <- append(u,c(1,1,1,1,1,1,1,1,Inf))
+    result <- optim(par = p,ll,x=data1,method = "L-BFGS-B", lower = l, upper = u)
+    res <- append(res,result)
+  }
+  print(res)
+  
+```
+Observations -
+Best Model : Mixtures of 5 Normal models
+Loglikelihood : -349.5825
+
+##Normal with Random forests covariates
+```{r}
+# choosing the number of mixtures
+  ll <- function(par,x) {
+      t = x[,1] 
+      C_r = x[,2]
+      ageD = x[,3]
+      albumin = x[,4]
+      ast = x[,5]
+      bili = x[,6]
+      copper = x[,7]
+      edema = x[,8]
+      protime = x[,9]
+      stage = x[,10]
+      ascites = x[,11]
+      chol= x[,12]
+      j = 1
+      k = 1
+      f_t = 0
+      F_t = 0
+      div = 0
+      while (j <= i){
+        f_t = f_t + (par[k]*dnorm(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage+
+                                   par[k+8]*ascites+
+                                   par[k+9]*bili+
+                                   par[k+10]*chol,
+                                   par[k+11]))
+        F_t = F_t + (par[k]*pnorm(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage+
+                                   par[k+8]*ascites+
+                                   par[k+9]*bili+
+                                   par[k+10]*chol,
+                                   par[k+11]))
+        div = div + par[k]
+        j=j+1
+        k=k+12
+      }
+    f_t = f_t/div
+    F_t = F_t/div
+    S_t = 1-F_t
+    
+    R = (1-C_r)*f_t + C_r*S_t 
+    
+    -sum(log(R))
+    }
+  n_mixtures = seq(2,8)
+  
+  set.seed(11)
+  
+  X = mm_df[['time']]
+  mux_init = mean(X)
+  sdx_init = sd(X)
+  
+  C_r =  mm_df[['status']]
+  mucr_init = mean(C_r)
+  sdcr_init = sd(C_r)
+
+  
+  data1 = cbind(X,C_r,mm_df[['ageD']],mm_df[['albumin']],mm_df[['ast']],mm_df[['bili']],mm_df[['copper']],mm_df[['edema']],mm_df[['protime']],mm_df[['stage']],mm_df[['ascites']],mm_df[['chol']])
+
+  p = c(0.5,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,sdx_init)
+  l = c(0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0)
+  u = c(1,1,1,1,1,1,1,1,1,1,1,Inf)
+  res = c(0)
+  for (i in n_mixtures){
+    p <- append(p,c(0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,0.1*i,sdx_init*0.1*i))
+    l <- append(l,c(0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0))
+    u <- append(u,c(1,1,1,1,1,1,1,1,1,1,1,Inf))
+    result <- optim(par = p,ll,x=data1,method = "L-BFGS-B", lower = l, upper = u)
+    res <- append(res,result)
+  }
+  print(res)
+```
+Observations -
+Best Model : Mixtures of 7 Normal models
+Loglikelihood : -343.0989
+
+## Loglogistic with best cox model covariates
+```{r}
+# choosing the number of mixtures
+  ll <- function(par,x) {
+      t = x[,1] 
+      C_r = x[,2]
+      ageD = x[,3]
+      albumin = x[,4]
+      ast = x[,5]
+      bili = x[,6]
+      copper = x[,7]
+      edema = x[,8]
+      protime = x[,9]
+      stage = x[,10]
+      ascites = x[,11]
+      chol= x[,12]
+      j = 1
+      k = 1
+      f_t = 0
+      F_t = 0
+      div = 0
+      while (j <= i){
+        f_t = f_t + (par[k]*dllogis(t,shape = par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage,
+                                   scale = par[k+8]))
+        F_t = F_t + (par[k]*pllogis(t,shape = par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage,
+                                   scale = par[k+8]))
+        div = div + par[k]
+        j=j+1
+        k=k+9
+      }
+    f_t = f_t/div
+    F_t = F_t/div
+    S_t = 1-F_t
+    
+    R = (1-C_r)*f_t + C_r*S_t 
+    
+    -sum(log(R))
+    }
+  n_mixtures = seq(2,8)
+  
+  set.seed(11)
+  
+  X = mm_df[['time']]
+  mux_init = mean(X)
+  sdx_init = sd(X)
+  
+  C_r =  mm_df[['status']]
+  mucr_init = mean(C_r)
+  sdcr_init = sd(C_r)
+
+  
+  data1 = cbind(X,C_r,mm_df[['ageD']]/50,mm_df[['albumin']]/50,mm_df[['ast']]/50,mm_df[['bili']]/50,mm_df[['copper']]/50,mm_df[['edema']]/50,mm_df[['protime']]/50,mm_df[['stage']]/50,mm_df[['ascites']]/50,mm_df[['chol']]/50)
+
+  p = c(0.5,0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.5)
+  l = c(0,-1,-1,-1,-1,-1,-1,-1,0)
+  u = c(1,1,1,1,1,1,1,1,Inf)
+  res = c(0)
+  for (i in n_mixtures){
+    p <- append(p,c(0.1*i,0.01*i,0.02*i,0.03*i,0.04*i,0.05*i,0.06*i,0.07*i,0.05*i))
+    l <- append(l,c(0,-1,-1,-1,-1,-1,-1,-1,0))
+    u <- append(u,c(1,1,1,1,1,1,1,1,Inf))
+    result <- optim(par = p,ll,x=data1,method = "L-BFGS-B", lower = l, upper = u)
+    res <- append(res,result)
+  }
+  print(res)
+  
+```
+Observations -
+Best Model : Mixtures of 2 Log Logistic models
+Loglikelihood : -683.1873
+
+##LogLogistic with Random forest covariates
+```{r}
+# choosing the number of mixtures
+  ll <- function(par,x) {
+      t = x[,1] 
+      C_r = x[,2]
+      ageD = x[,3]
+      albumin = x[,4]
+      ast = x[,5]
+      bili = x[,6]
+      copper = x[,7]
+      edema = x[,8]
+      protime = x[,9]
+      stage = x[,10]
+      ascites = x[,11]
+      chol= x[,12]
+      j = 1
+      k = 1
+      f_t = 0
+      F_t = 0
+      div = 0
+      while (j <= i){
+        f_t = f_t + (par[k]*dllogis(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage+
+                                   par[k+8]*ascites+
+                                   par[k+9]*bili+
+                                   par[k+10]*chol,
+                                   scale = par[k+11]))
+        F_t = F_t + (par[k]*pllogis(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage+
+                                   par[k+8]*ascites+
+                                   par[k+9]*bili+
+                                   par[k+10]*chol,
+                                   scale = par[k+11]))
+        div = div + par[k]
+        j=j+1
+        k=k+12
+      }
+    f_t = f_t/div
+    F_t = F_t/div
+    S_t = 1-F_t
+    
+    R = (1-C_r)*f_t + C_r*S_t 
+    
+    -sum(log(R))
+    }
+  n_mixtures = seq(2,8)
+  
+  set.seed(11)
+  
+  X = mm_df[['time']]
+  mux_init = mean(X)
+  sdx_init = sd(X)
+  
+  C_r =  mm_df[['status']]
+  mucr_init = mean(C_r)
+  sdcr_init = sd(C_r)
+
+  
+  data1 = cbind(X,C_r,mm_df[['ageD']]/100,mm_df[['albumin']]/100,mm_df[['ast']]/100,mm_df[['bili']]/100,mm_df[['copper']]/100,mm_df[['edema']]/100,mm_df[['protime']]/100,mm_df[['stage']]/100,mm_df[['ascites']]/100,mm_df[['chol']]/100)
+
+  p = c(0.5,0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.5)
+  l = c(0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0)
+  u = c(1,1,1,1,1,1,1,1,1,1,1,Inf)
+  res = c(0)
+  for (i in n_mixtures){
+    p <- append(p,c(0.1*i,0.01*i,0.02*i,0.03*i,0.04*i,0.05*i,0.06*i,0.07*i,0.08*i,0.09*i,0.1*i,0.05*i))
+    l <- append(l,c(0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0))
+    u <- append(u,c(1,1,1,1,1,1,1,1,1,1,1,Inf))
+    result <- optim(par = p,ll,x=data1,method = "L-BFGS-B", lower = l, upper = u)
+    res <- append(res,result)
+  }
+  print(res)
+```
+Observations -
+Best Model : Mixtures of 2 Log Logistic models
+Loglikelihood : -765.6595
+
+## Weibull with best cox model covariates
+```{r}
+# choosing the number of mixtures
+  ll <- function(par,x) {
+      t = x[,1] 
+      C_r = x[,2]
+      ageD = x[,3]
+      albumin = x[,4]
+      ast = x[,5]
+      bili = x[,6]
+      copper = x[,7]
+      edema = x[,8]
+      protime = x[,9]
+      stage = x[,10]
+      ascites = x[,11]
+      chol= x[,12]
+      j = 1
+      k = 1
+      f_t = 0
+      F_t = 0
+      div = 0
+      while (j <= i){
+        f_t = f_t + (par[k]*dweibull(t,shape = par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage,
+                                   scale = par[k+8]))
+        F_t = F_t + (par[k]*pweibull(t,shape = par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage,
+                                   scale = par[k+8]))
+        div = div + par[k]
+        j=j+1
+        k=k+9
+      }
+    f_t = f_t/div
+    F_t = F_t/div
+    S_t = 1-F_t
+    
+    R = (1-C_r)*f_t + C_r*S_t 
+    
+    -sum(log(R))
+    }
+  n_mixtures = seq(2,8)
+  
+  set.seed(11)
+  
+  X = mm_df[['time']]
+  mux_init = mean(X)
+  sdx_init = sd(X)
+  
+  C_r =  mm_df[['status']]
+  mucr_init = mean(C_r)
+  sdcr_init = sd(C_r)
+
+  
+  data1 = cbind(X,C_r,mm_df[['ageD']]/50,mm_df[['albumin']]/50,mm_df[['ast']]/50,mm_df[['bili']]/50,mm_df[['copper']]/50,mm_df[['edema']]/50,mm_df[['protime']]/50,mm_df[['stage']]/50,mm_df[['ascites']]/50,mm_df[['chol']]/50)
+
+  p = c(0.5,0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.5)
+  l = c(0,-1,-1,-1,-1,-1,-1,-1,0)
+  u = c(1,1,1,1,1,1,1,1,10)
+  res = c(0)
+  for (i in n_mixtures){
+    p <- append(p,c(0.1*i,0.01*i,0.02*i,0.03*i,0.04*i,0.05*i,0.06*i,0.07*i,0.05*i))
+    l <- append(l,c(0,-1,-1,-1,-1,-1,-1,-1,0))
+    u <- append(u,c(1,1,1,1,1,1,1,1,10))
+    result <- optim(par = p,ll,x=data1,method = "L-BFGS-B", lower = l, upper = u)
+    res <- append(res,result)
+  }
+  print(res)
+  
+```
+Observations -
+Best Model : Mixtures of 2 Weibull models
+Loglikelihood : -651.8244
+
+## Weibull with Random forest covariates
+```{r}
+# choosing the number of mixtures
+  ll <- function(par,x) {
+      t = x[,1] 
+      C_r = x[,2]
+      ageD = x[,3]
+      albumin = x[,4]
+      ast = x[,5]
+      bili = x[,6]
+      copper = x[,7]
+      edema = x[,8]
+      protime = x[,9]
+      stage = x[,10]
+      ascites = x[,11]
+      chol= x[,12]
+      j = 1
+      k = 1
+      f_t = 0
+      F_t = 0
+      div = 0
+      while (j <= i){
+        f_t = f_t + (par[k]*dweibull(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage+
+                                   par[k+8]*ascites+
+                                   par[k+9]*bili+
+                                   par[k+10]*chol,
+                                   scale = par[k+11]))
+        F_t = F_t + (par[k]*pweibull(t,par[k+1]*ageD+
+                                   par[k+2]*albumin+
+                                   par[k+3]*ast+
+                                   par[k+4]*copper+
+                                   par[k+5]*edema+
+                                   par[k+6]*protime+
+                                   par[k+7]*stage+
+                                   par[k+8]*ascites+
+                                   par[k+9]*bili+
+                                   par[k+10]*chol,
+                                   scale = par[k+11]))
+        div = div + par[k]
+        j=j+1
+        k=k+12
+      }
+    f_t = f_t/div
+    F_t = F_t/div
+    S_t = 1-F_t
+    
+    R = (1-C_r)*f_t + C_r*S_t 
+    
+    -sum(log(R))
+    }
+  n_mixtures = seq(2,8)
+  
+  set.seed(11)
+  
+  X = mm_df[['time']]
+  mux_init = mean(X)
+  sdx_init = sd(X)
+  
+  C_r =  mm_df[['status']]
+  mucr_init = mean(C_r)
+  sdcr_init = sd(C_r)
+
+  
+  data1 = cbind(X,C_r,mm_df[['ageD']]/100,mm_df[['albumin']]/100,mm_df[['ast']]/100,mm_df[['bili']]/100,mm_df[['copper']]/100,mm_df[['edema']]/100,mm_df[['protime']]/100,mm_df[['stage']]/100,mm_df[['ascites']]/100,mm_df[['chol']]/100)
+
+  p = c(0.5,0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.5)
+  l = c(0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0)
+  u = c(1,1,1,1,1,1,1,1,1,1,1,Inf)
+  res = c(0)
+  for (i in n_mixtures){
+    p <- append(p,c(0.1*i,0.01*i,0.02*i,0.03*i,0.04*i,0.05*i,0.06*i,0.07*i,0.08*i,0.09*i,0.1*i,0.05*i))
+    l <- append(l,c(0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0))
+    u <- append(u,c(1,1,1,1,1,1,1,1,1,1,1,Inf))
+    result <- optim(par = p,ll,x=data1,method = "L-BFGS-B", lower = l, upper = u)
+    res <- append(res,result)
+  }
+  print(res)
+```
+Observations 
+Best Model : Mixtures of 2 Weibull models
+Loglikelihood : -725.052
+
+# Comparing the loglikelihoods of Parametric regression models and Mixture models
+```{r}
+p_df <- data.frame(c("LogLogistic","LogNormal","Weibull","Exponential"),c(-252.5,-255.3,-255.4,-268.5)) 
+names(p_df) <- c('Model',"Loglikelihood")
+m_df <- data.frame(c("Mixture of LogNormals","Mixture of Normals","Mixture of Loglogistics","Mixture of Weibulls"),c(-363.2742,-349.5825,-683.1873,-651.8244),c(8,5,2,2),c(-362.9548,-343.0989,-765.6595,-725.052),c(8,7,2,2))
+names(m_df) <- c("Models","LogLikelihood(Best Cox model covariates)","No.of mixtures","LogLikelihood(Best Random forests covariates)","No.of mixtures")
+```
+```{r}
+p_df
+m_df
+```
+
+Theoretically Gaussians are flexible to the input data and hence widely used as the component distribution of the Mixture models. Though the Loglogistic regression model was the best among the parametric regression models, when mixture models are concerned, mixture of gaussians perform better than any other component distributions and the same is observed here.
+
+# Conclusion
+In this study, we have identified some significant covariates on survival probability of patients. We have tried understanding the survival dependencies of the covariates by fitting various models such as Kaplan Meier, Cox PH, Random forests,Parametric Regression Models.
+We also tested and observed Mixture Models having a custom likelihood function using Mixtures of various probability Distributions.
